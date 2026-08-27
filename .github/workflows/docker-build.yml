@@ -6,7 +6,10 @@ name: Build and Push llama.cpp Qwen3.8 Image
 
 on:
   push:
-    branches: [main]
+    # Both names on purpose: `gh repo create --push` from a fresh `git init`
+    # produces `master`, while the GitHub web UI defaults to `main`. Pinning
+    # only one silently means zero workflow runs and no image.
+    branches: [main, master]
     paths:
       - 'Dockerfile'
       - 'start_qwen38_q8.sh'
