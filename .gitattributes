@@ -1,0 +1,6 @@
+# Shell scripts and the Dockerfile run inside a Linux container. CRLF endings
+# break the shebang ("bad interpreter: /usr/bin/env bash^M"), which on Windows
+# checkouts is otherwise an easy accident.
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.yml text eol=lf
