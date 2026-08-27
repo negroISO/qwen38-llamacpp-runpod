@@ -1,0 +1,96 @@
+name: Build and Push llama.cpp Qwen3.8 Image
+
+# Mirrors the workflow in comfyui-base-runpod-bw: build in CI, push to ghcr.io,
+# never build on the pod. A 4-architecture CUDA build is 20-40 min of compile,
+# which is exactly what you do not want to pay GPU rates for.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Dockerfile'
+      - 'start_qwen38_q8.sh'
+      - '.github/workflows/docker-build.yml'
+  workflow_dispatch:
+    inputs:
+      llama_ref:
+        description: 'llama.cpp git ref to build (branch, tag, or commit)'
+        required: false
+        default: 'master'
+
+# The ghcr package is created automatically on the first successful push --
+# nothing to pre-create. Note that a NEW package defaults to PRIVATE, so after
+# the first run set Package settings -> Change visibility -> Public, or give
+# RunPod a registry credential. A private package that RunPod cannot pull looks
+# like a stuck "pulling image" with no useful error.
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/qwen38-llamacpp
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # The CUDA devel image plus a 4-arch build fills the default runner disk.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo rm -rf /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          df -h /
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=q8
+            type=sha,prefix=
+            type=ref,event=branch
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            LLAMA_REF=${{ github.event.inputs.llama_ref || 'master' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+      - name: Generate build summary
+        run: |
+          echo "## llama.cpp Qwen3.8 Q8_K_P" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:q8\`" >> $GITHUB_STEP_SUMMARY
+          echo "**llama.cpp ref:** \`${{ github.event.inputs.llama_ref || 'master' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### CUDA architectures" >> $GITHUB_STEP_SUMMARY
+          echo "| target | hardware |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| \`90a-real\` | H200, H100 |" >> $GITHUB_STEP_SUMMARY
+          echo "| \`100a-real\` | B200 |" >> $GITHUB_STEP_SUMMARY
+          echo "| \`120a-real\` | RTX PRO 6000 Blackwell |" >> $GITHUB_STEP_SUMMARY
+          echo "| \`120-virtual\` | PTX fallback |" >> $GITHUB_STEP_SUMMARY

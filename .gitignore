@@ -1,0 +1,8 @@
+# Never commit model weights -- Q8_K_P alone is 31.46 GB.
+*.gguf
+models/
+/workspace/
+
+# Local scratch
+.env
+*.log
