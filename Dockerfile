@@ -52,18 +52,41 @@ ARG CUDA_ARCHS="90a-real;100a-real;120a-real;120-virtual"
 # binary that touches cuMemCreate/cuMemMap/etc fails with:
 #     ld: warning: libcuda.so.1 ... not found
 #     ld: undefined reference to `cuMemCreate'
-# The toolkit ships link-time stubs for exactly this case. Point the linker at
-# them; at runtime the real driver in the container takes over.
-ENV LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH}
-RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so \
-           /usr/local/cuda/lib64/stubs/libcuda.so.1
+# The toolkit ships link-time stubs for exactly this case (in
+# cuda-cudart-dev-13-3). At runtime the real driver takes over.
+#
+# DO NOT hardcode /usr/local/cuda/lib64/stubs: CUDA 13 versions that path, and
+# a previous attempt at this fix pointed at a directory that did not exist. It
+# failed silently because `ln -sf` happily creates a dangling symlink and
+# LIBRARY_PATH entries that do not exist are ignored -- so the build ran for 50
+# minutes and died with the same link error. Find the stub, verify it, and fail
+# loudly if it is missing.
+RUN set -eux; \
+    stub="$(find /usr/local /usr/lib -name 'libcuda.so' -path '*stubs*' \
+              -print -quit 2>/dev/null)"; \
+    test -n "$stub" || { echo "FATAL: no libcuda.so stub found"; exit 1; }; \
+    dir="$(dirname "$stub")"; \
+    ln -sf "$stub" "$dir/libcuda.so.1"; \
+    echo "$dir" > /etc/ld.so.conf.d/cuda-stubs.conf; \
+    echo "CUDA_STUB_DIR=$dir"; \
+    printf '%s\n' "$dir" > /tmp/cuda_stub_dir; \
+    printf 'extern int cuMemCreate();\nint main(){return cuMemCreate();}\n' > /tmp/t.c; \
+    gcc /tmp/t.c -L"$dir" -lcuda -o /tmp/t \
+      || { echo "FATAL: cannot link against libcuda stub in $dir"; exit 1; }; \
+    echo "stub link check: OK"; \
+    rm -f /tmp/t /tmp/t.c
 
 # --target llama-server, not a full build. LLAMA_BUILD_EXAMPLES=OFF does NOT
 # exclude tools/ -- llama-batched-bench, llama-bench, llama-imatrix and friends
 # still build, and they are ~120 extra link steps for binaries this image never
 # runs. Building just the server target is faster and removes a whole class of
 # unrelated link failures.
-RUN cmake -S /src -B /src/build -G Ninja \
+# LIBRARY_PATH is exported from the discovered stub dir here rather than via
+# ENV, because ENV cannot read a shell variable produced by an earlier RUN.
+RUN set -eux; \
+    export LIBRARY_PATH="$(cat /tmp/cuda_stub_dir):${LIBRARY_PATH:-}"; \
+    echo "linking against stubs in: $LIBRARY_PATH"; \
+    cmake -S /src -B /src/build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DGGML_CUDA=ON \
         -DGGML_NATIVE=OFF \
@@ -73,7 +96,9 @@ RUN cmake -S /src -B /src/build -G Ninja \
         -DLLAMA_BUILD_EXAMPLES=OFF \
         -DLLAMA_BUILD_TOOLS=ON \
         -DLLAMA_BUILD_SERVER=ON \
-        -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" && \
+        -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
+        -DCMAKE_EXE_LINKER_FLAGS="-L$(cat /tmp/cuda_stub_dir)" \
+        -DCMAKE_SHARED_LINKER_FLAGS="-L$(cat /tmp/cuda_stub_dir)"; \
     cmake --build /src/build --config Release -j"$(nproc)" --target llama-server
 
 # Collect by hand rather than `cmake --install`: a --target build populates
