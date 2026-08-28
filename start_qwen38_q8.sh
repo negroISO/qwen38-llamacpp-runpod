@@ -141,21 +141,78 @@ ARGS=(
   --alias qwen3.8-27b-uncensored
 )
 
+# Reasoning flags, straight from the model card's own serve command. Qwen3.8 is
+# a thinking model and these were all missing, which matters for multi-turn
+# agents: llama-server itself logs "chat template supports preserving
+# reasoning, consider enabling it via --reasoning-preserve" on startup, and the
+# card recommends preserve_thinking for exactly that case.
+#
+# --reasoning-preserve keeps prior turns' reasoning in context instead of
+# dropping it, and --reasoning-format controls how it is emitted over the API.
+# Codex fails on turn 2 while replaying prior assistant turns, so how reasoning
+# is represented is directly implicated.
+#
+# REASONING_EFFORT: the card supports xhigh|medium|low. xhigh is its deepest
+# setting but spends the most tokens thinking before answering; medium is the
+# saner default for an interactive coding agent. Override per pod.
+ARGS+=( --reasoning on
+        --reasoning-effort "${REASONING_EFFORT:-medium}"
+        --reasoning-preserve
+        --reasoning-format "${REASONING_FORMAT:-deepseek}" )
+
 # Sampler values from the model card's own serving profile.
 ARGS+=( --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0
         --presence-penalty 0 --repeat-penalty 1.0 )
 
-if [[ "$WANT_MTP" == "1" ]]; then
-  ARGS+=( --spec-draft-model "$MODELS_DIR/$DRAFT_FILE"
-          --spec-draft-ngl all
-          --spec-type draft-mtp
-          --spec-draft-n-max 3
-          --spec-draft-p-min 0 )
-fi
+# Two DIFFERENT accelerations, previously conflated under one flag:
+#
+#   embedded   Qwen3.8's own NextN head, driven by --spec-type draft-mtp with
+#              NO sidecar. The model card calls this "optional and
+#              stock-compatible in current llama.cpp" -- no patch needed. Worth
+#              roughly 2.2x document TG / 1.6x reasoning TG per the card.
+#
+#   fastmtp    The separate FastMTP-32K sidecar. Needs HauhauCS's llama.cpp
+#              patch on pinned commit 4df29be, which this image does NOT carry.
+#              Verified on a live pod: enabling it crash-loops llama-server with
+#                check_tensor_dims: tensor 'output.weight' has wrong shape;
+#                expected 5120, 248320, got 5120, 32768
+#              (32768 = draft vocab, 248320 = Qwen3.8's padded vocab).
+#
+# The old WANT_MTP=1 meant "fastmtp", so the safe default became 0 -- which
+# also threw away the free embedded speedup. Now they are separate.
+case "${MTP_MODE:-$([[ "$WANT_MTP" == "1" ]] && echo fastmtp || echo embedded)}" in
+  embedded)
+    ARGS+=( --spec-type draft-mtp
+            --spec-draft-n-max "${SPEC_DRAFT_N_MAX:-3}"
+            --spec-draft-p-min 0 )
+    MTP_DESC="embedded (no sidecar, stock llama.cpp)"
+    ;;
+  fastmtp)
+    if [[ ! -f "$MODELS_DIR/$DRAFT_FILE" ]]; then
+      echo "FATAL: MTP_MODE=fastmtp needs $DRAFT_FILE; set WANT_MTP=1 to fetch it." >&2
+      exit 5
+    fi
+    echo "[serve] WARNING: fastmtp requires HauhauCS's patched llama.cpp." >&2
+    echo "[serve]          On a stock build llama-server will refuse to load." >&2
+    ARGS+=( --spec-draft-model "$MODELS_DIR/$DRAFT_FILE"
+            --spec-draft-ngl all
+            --spec-type draft-mtp
+            --spec-draft-n-max "${SPEC_DRAFT_N_MAX:-3}"
+            --spec-draft-p-min 0 )
+    MTP_DESC="fastmtp (sidecar; needs patched build)"
+    ;;
+  off|none)
+    MTP_DESC="off"
+    ;;
+  *)
+    echo "FATAL: MTP_MODE must be embedded, fastmtp, or off" >&2; exit 5 ;;
+esac
 
 [[ "$WANT_VISION" == "1" ]] && ARGS+=( --mmproj "$MODELS_DIR/$MMPROJ_FILE" )
 
-echo "[serve] ctx=$CTX_SIZE port=$PORT mtp=$WANT_MTP vision=$WANT_VISION"
+echo "[serve] ctx=$CTX_SIZE port=$PORT vision=$WANT_VISION"
+echo "[serve] mtp=$MTP_DESC"
+echo "[serve] reasoning=on effort=${REASONING_EFFORT:-medium} preserve=on format=${REASONING_FORMAT:-deepseek}"
 echo "[serve] health:  curl -s localhost:$PORT/health"
 echo "[serve] models:  curl -s -H 'Authorization: Bearer \$LLAMA_API_KEY' localhost:$PORT/v1/models"
 exec "$LLAMA_SERVER" "${ARGS[@]}"
