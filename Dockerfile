@@ -9,13 +9,40 @@ FROM nvidia/cuda:13.3.1-cudnn-devel-ubuntu24.04 AS build
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git build-essential cmake ninja-build ccache \
-        libcurl4-openssl-dev ca-certificates python3 \
+        libcurl4-openssl-dev ca-certificates python3 curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Pin a commit for reproducible images. Override at build time to move forward.
 ARG LLAMA_REF=master
 RUN git clone https://github.com/ggml-org/llama.cpp /src && \
     cd /src && git checkout "${LLAMA_REF}"
+
+# Optional upstream PR patches, applied in order. Comma-separated PR numbers.
+#
+# Default carries PR 27751 -- "server : fix Responses API item parsing for
+# reasoning and Codex compatibility". Without it, Codex CLI dies on the second
+# turn of any conversation with:
+#     400 Cannot determine type of 'item'
+# because llama.cpp cannot classify an assistant message whose `content` is an
+# array and which lacks an explicit "type":"message". That is exactly the shape
+# Codex uses when replaying its own prior turns. Verified against b10665 with a
+# minimal curl repro; the same body with "type":"message" added succeeds.
+#
+# It is an OPEN PR (unreviewed as of 2026-08-28), so it is in no release --
+# bumping LLAMA_REF alone does not help. Set LLAMA_PRS="" to build stock.
+ARG LLAMA_PRS=27751
+RUN set -eux; \
+    if [ -n "${LLAMA_PRS}" ]; then \
+      for pr in $(echo "${LLAMA_PRS}" | tr ',' ' '); do \
+        echo "applying upstream PR #${pr}"; \
+        curl -fsSL -o "/tmp/pr${pr}.patch" \
+          "https://github.com/ggml-org/llama.cpp/pull/${pr}.patch"; \
+        cd /src; \
+        git apply --check "/tmp/pr${pr}.patch" \
+          || { echo "FATAL: PR #${pr} no longer applies to ${LLAMA_REF} -- it was probably merged or rebased. Rebuild with LLAMA_PRS= to drop it."; exit 1; }; \
+        git apply "/tmp/pr${pr}.patch"; \
+      done; \
+    fi
 
 # The architecture list is the whole point of this image, so it is set
 # explicitly rather than left to llama.cpp's default.

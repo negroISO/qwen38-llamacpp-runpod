@@ -20,6 +20,10 @@ on:
         description: 'llama.cpp git ref to build (branch, tag, or commit)'
         required: false
         default: 'master'
+      llama_prs:
+        description: 'Upstream PRs to patch in (comma-separated). Empty = stock. 27751 fixes Codex "Cannot determine type of item".'
+        required: false
+        default: '27751'
 
 # The ghcr package is created automatically on the first successful push --
 # nothing to pre-create. Note that a NEW package defaults to PRIVATE, so after
@@ -79,6 +83,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             LLAMA_REF=${{ github.event.inputs.llama_ref || 'master' }}
+            LLAMA_PRS=${{ github.event.inputs.llama_prs || '27751' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/amd64
