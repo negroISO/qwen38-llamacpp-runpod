@@ -46,6 +46,23 @@ ARG CUDA_ARCHS="90a-real;100a-real;120a-real;120-virtual"
 
 # GGML_NATIVE=OFF is mandatory: ON bakes in the *build* machine's -march and
 # CUDA arch, which would defeat a portable image.
+#
+# libcuda.so.1 is the CUDA *driver* API. It ships with the NVIDIA driver on a
+# GPU host, NOT with the toolkit, so a CI runner has no copy and linking any
+# binary that touches cuMemCreate/cuMemMap/etc fails with:
+#     ld: warning: libcuda.so.1 ... not found
+#     ld: undefined reference to `cuMemCreate'
+# The toolkit ships link-time stubs for exactly this case. Point the linker at
+# them; at runtime the real driver in the container takes over.
+ENV LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH}
+RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so \
+           /usr/local/cuda/lib64/stubs/libcuda.so.1
+
+# --target llama-server, not a full build. LLAMA_BUILD_EXAMPLES=OFF does NOT
+# exclude tools/ -- llama-batched-bench, llama-bench, llama-imatrix and friends
+# still build, and they are ~120 extra link steps for binaries this image never
+# runs. Building just the server target is faster and removes a whole class of
+# unrelated link failures.
 RUN cmake -S /src -B /src/build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DGGML_CUDA=ON \
@@ -54,10 +71,19 @@ RUN cmake -S /src -B /src/build -G Ninja \
         -DLLAMA_CURL=ON \
         -DLLAMA_BUILD_TESTS=OFF \
         -DLLAMA_BUILD_EXAMPLES=OFF \
+        -DLLAMA_BUILD_TOOLS=ON \
         -DLLAMA_BUILD_SERVER=ON \
         -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" && \
-    cmake --build /src/build --config Release -j"$(nproc)" && \
-    cmake --install /src/build --prefix /opt/llama
+    cmake --build /src/build --config Release -j"$(nproc)" --target llama-server
+
+# Collect by hand rather than `cmake --install`: a --target build populates
+# only part of the install manifest, and a silently-empty install would not
+# surface until the container failed to start. Fail loudly here instead.
+RUN mkdir -p /opt/llama/bin /opt/llama/lib && \
+    cp /src/build/bin/llama-server /opt/llama/bin/ && \
+    cp /src/build/bin/*.so* /opt/llama/lib/ && \
+    test -x /opt/llama/bin/llama-server && \
+    ls /opt/llama/lib/libggml-cuda.so* >/dev/null
 
 # ---------------------------------------------------------------------------
 # Runtime: the CUDA *runtime* image, not devel. Drops ~5GB of toolchain.
@@ -68,11 +94,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libcurl4 libgomp1 ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
+# The build stage already gathered llama-server and every ggml backend .so
+# into /opt/llama, so one copy is enough. (A second `COPY *.so` would also
+# miss the real files, which are versioned: libggml-cuda.so.0.22.0.)
 COPY --from=build /opt/llama /opt/llama
-# ggml backends build as shared libs; copy them or llama-server will not start.
-COPY --from=build /src/build/bin/*.so /opt/llama/lib/
 ENV PATH="/opt/llama/bin:${PATH}" \
     LD_LIBRARY_PATH="/opt/llama/lib:${LD_LIBRARY_PATH}"
+
+# Fail at build time, not on the pod, if the binary cannot resolve its libs.
+# The only expected "not found" is libcuda.so.1, which the NVIDIA container
+# runtime injects at run time.
+RUN ldd /opt/llama/bin/llama-server | grep -v "libcuda.so.1" | grep "not found" \
+    && { echo "FATAL: unresolved libraries above"; exit 1; } || true
 
 COPY start_qwen38_q8.sh /usr/local/bin/start_qwen38_q8.sh
 RUN chmod +x /usr/local/bin/start_qwen38_q8.sh
