@@ -115,8 +115,11 @@ RUN mkdir -p /opt/llama/bin /opt/llama/lib && \
 FROM nvidia/cuda:13.3.1-cudnn-runtime-ubuntu24.04
 
 ARG DEBIAN_FRONTEND=noninteractive
+# aria2 is the download accelerator: 16 parallel connections instead of curl's
+# one. Measured on a live pod, a single curl stream took ~50 min for 29.2 GiB.
+# curl stays as the fallback path in the start script.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libcurl4 libgomp1 ca-certificates curl \
+        libcurl4 libgomp1 ca-certificates curl aria2 \
     && rm -rf /var/lib/apt/lists/*
 
 # The build stage already gathered llama-server and every ggml backend .so
@@ -136,10 +139,17 @@ COPY start_qwen38_q8.sh /usr/local/bin/start_qwen38_q8.sh
 RUN chmod +x /usr/local/bin/start_qwen38_q8.sh
 
 # Model cache lives on the RunPod volume so a restart does not re-pull 31GB.
+#
+# WANT_MTP=0 is REQUIRED, not a preference. Verified on a live pod: 1 puts
+# llama-server in a crash loop, because the FastMTP sidecar needs HauhauCS's
+# patched llama.cpp (pinned commit 4df29be) which this image does not carry:
+#     check_tensor_dims: tensor 'output.weight' has wrong shape;
+#     expected 5120, 248320, got 5120, 32768
+# This ENV also has to stay 0 because ENV overrides the script's own default.
 ENV MODELS_DIR=/workspace/models \
     CTX_SIZE=131072 \
     PORT=8000 \
-    WANT_MTP=1 \
+    WANT_MTP=0 \
     WANT_VISION=0
 EXPOSE 8000
 

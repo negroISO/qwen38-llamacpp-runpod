@@ -28,10 +28,21 @@ CTX_SIZE="${CTX_SIZE:-131072}"
 PORT="${PORT:-8000}"
 # Vision needs the 931MB projector. Off by default: it costs VRAM and download.
 WANT_VISION="${WANT_VISION:-0}"
-# Speculative decoding via the model's embedded MTP head. Needs a recent
-# llama.cpp; the bigger HauhauCS FastMTP gain needs their patched build, which
-# is a from-source compile on every cold start unless you bake an image.
-WANT_MTP="${WANT_MTP:-1}"
+# Speculative decoding with the HauhauCS FastMTP sidecar.
+#
+# OFF by default, and it must stay that way for this image. Verified on a live
+# pod: enabling it makes llama-server refuse to start, in a crash loop --
+#     check_tensor_dims: tensor 'output.weight' has wrong shape;
+#     expected 5120, 248320, got 5120, 32768
+# 32768 is the draft's vocab, 248320 is Qwen3.8's padded vocab. The model card
+# names this exact symptom: the sidecar is fine, the EXECUTABLE is unpatched.
+# FastMTP needs HauhauCS's llama.cpp patch on pinned commit 4df29be, which this
+# image deliberately does not carry (it would mean compiling from source on
+# every cold start).
+#
+# Turning this on without first building the patched llama.cpp will break the
+# pod, not merely lose the speedup.
+WANT_MTP="${WANT_MTP:-0}"
 
 if [[ -z "${LLAMA_API_KEY:-}" ]]; then
   echo "FATAL: set LLAMA_API_KEY. An open port on a public pod is an open model." >&2
@@ -54,8 +65,22 @@ fetch() {  # fetch <filename> <sha256>
     rm -f "$dest"
   fi
   echo "[models] downloading $f ..."
-  # -C - resumes a partial file; RunPod network drops mid-pull are common.
-  curl -fL -C - --retry 5 --retry-delay 5 -o "$dest" "$BASE/$f"
+  # aria2c opens 16 parallel connections; curl uses ONE. Measured on this pod:
+  # a single curl stream pulled 29.2 GiB in ~50 min, averaging ~10 MB/s while
+  # swinging between 1.5 and 53 MB/s -- the signature of one connection at the
+  # mercy of one CDN edge. Parallel chunks flatten that out.
+  #
+  # Both paths resume a partial file (-c / -C -), which matters because the
+  # model lands on a persistent volume and RunPod network drops are common.
+  if command -v aria2c >/dev/null 2>&1; then
+    aria2c --console-log-level=warn --summary-interval=30 \
+           -x16 -s16 -k16M -c --retry-wait=5 -m5 \
+           --auto-file-renaming=false --allow-overwrite=true \
+           -d "$MODELS_DIR" -o "$f" "$BASE/$f"
+  else
+    echo "[models] aria2c not found, falling back to single-stream curl" >&2
+    curl -fL -C - --retry 5 --retry-delay 5 -o "$dest" "$BASE/$f"
+  fi
   local got
   got="$(sha256sum "$dest" | awk '{print $1}')"
   if [[ "$got" != "$want" ]]; then
