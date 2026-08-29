@@ -31,17 +31,33 @@ RUN git clone https://github.com/ggml-org/llama.cpp /src && \
 # It is an OPEN PR (unreviewed as of 2026-08-28), so it is in no release --
 # bumping LLAMA_REF alone does not help. Set LLAMA_PRS="" to build stock.
 ARG LLAMA_PRS=27751
+# The patch fetch must tolerate GitHub rate limiting. A previous build failed
+# in 3 minutes with `curl: (22) ... error: 429` purely because an earlier build
+# had pulled the same URL ~28 min before from the same runner IP range -- the
+# patch itself was fine. So: retry on 429/5xx, then fall back to fetching the
+# PR's merge ref over git, which is served by different infrastructure.
 RUN set -eux; \
     if [ -n "${LLAMA_PRS}" ]; then \
+      cd /src; \
       for pr in $(echo "${LLAMA_PRS}" | tr ',' ' '); do \
         echo "applying upstream PR #${pr}"; \
-        curl -fsSL -o "/tmp/pr${pr}.patch" \
-          "https://github.com/ggml-org/llama.cpp/pull/${pr}.patch"; \
-        cd /src; \
-        git apply --check "/tmp/pr${pr}.patch" \
-          || { echo "FATAL: PR #${pr} no longer applies to ${LLAMA_REF} -- it was probably merged or rebased. Rebuild with LLAMA_PRS= to drop it."; exit 1; }; \
-        git apply "/tmp/pr${pr}.patch"; \
+        if curl -fsSL --retry 6 --retry-delay 10 --retry-all-errors \
+             -o "/tmp/pr${pr}.patch" \
+             "https://github.com/ggml-org/llama.cpp/pull/${pr}.patch"; then \
+          git apply --check "/tmp/pr${pr}.patch" \
+            || { echo "FATAL: PR #${pr} no longer applies to ${LLAMA_REF} -- probably merged or rebased. Rebuild with LLAMA_PRS= to drop it."; exit 1; }; \
+          git apply "/tmp/pr${pr}.patch"; \
+          echo "PR #${pr} applied from patch file"; \
+        else \
+          echo "patch URL unavailable (rate limit?), falling back to git fetch"; \
+          git fetch --no-tags origin "pull/${pr}/head:pr${pr}" \
+            || { echo "FATAL: could not fetch PR #${pr} by patch or by ref"; exit 1; }; \
+          git cherry-pick --no-commit $(git rev-list --reverse "HEAD..pr${pr}") \
+            || { echo "FATAL: PR #${pr} does not apply cleanly onto ${LLAMA_REF}"; exit 1; }; \
+          echo "PR #${pr} applied via git fetch"; \
+        fi; \
       done; \
+      echo "--- patched files ---"; git status --porcelain | head; \
     fi
 
 # The architecture list is the whole point of this image, so it is set
